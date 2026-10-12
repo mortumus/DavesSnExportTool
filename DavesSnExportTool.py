@@ -594,8 +594,13 @@ def main():
             }
         
         # Do the export
-        if (state.last_sysid or state.page_num != 0):
+        if (config.resume and (state.last_sysid or state.page_num != 0)):
             log.info(f"Resuming export from sys_id {state.last_sysid}, page {state.page_num}")
+
+        if (not config.resume):
+            log.debug("Resume disabled, clearing resume state")
+            state.page_num = 0
+            state.last_sysid = ""
 
         result = exportCsv(session)
         
