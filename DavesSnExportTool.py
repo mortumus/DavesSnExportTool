@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 
 SN_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 SN_ENCODING = "windows-1252"
+DEFAULT_EXPORT_DIR = "./export/"
+STATE_FILE_NAME = "{0}.state.json"
 
 log = logging.getLogger()
 
@@ -22,15 +24,20 @@ class State:
     def __init__(self):
         self.delta_timestamp = ""
         self.last_sysid = ""
+        self.page_num = 0
 state = State()
 
+def getStateFileName() -> str:
+    return os.path.join(config.export_dir, STATE_FILE_NAME.format(config.out_file))
+
 def saveState(state):
-    if (not config.state_file):
+    if (config.no_state):
         return # Skip if state file not being used
     
-    stateFilePath = config.state_file
+    stateFilePath = getStateFileName()
     stateOut = {}
     stateOut["last_sysid"] = state.last_sysid
+    stateOut["page_num"] = state.page_num
     stateOut["delta_timestamp"] = state.delta_timestamp
 
     stateJson = json.dumps(stateOut)
@@ -42,9 +49,10 @@ def saveState(state):
 def loadState(state:State):
     log.debug("Loading state")
 
-    with open(config.state_file, "r") as f:
+    with open(getStateFileName(), "r") as f:
         stateIn = json.load(f)
 
+    if ("page_num" in stateIn): state.page_num = int(stateIn["page_num"])
     if ("delta_timestamp" in stateIn): state.delta_timestamp = stateIn["delta_timestamp"]
     if ("last_sysid" in stateIn): state.last_sysid = stateIn["last_sysid"]
 
@@ -59,10 +67,12 @@ class Config:
         self.instance_url = ""
         self.export_type = "csv"
         self.page_size = 1000
+        self.resume = False
         self.start_sysid = ""
+        self.start_page = 0
         self.export_table = ""
         self.export_query = ""
-        self.temp_dir = os.path.join(".", "tmp")
+        self.export_dir = os.path.join(".", DEFAULT_EXPORT_DIR)
         self.export_fields = "*"
         self.out_file = "export"
         self.display_values = True
@@ -74,7 +84,7 @@ class Config:
         self.output_timestamp = False
         self.work_dir = "./"
         self.combine_output = False
-        self.state_file = ""
+        self.no_state = False
         self.progress = False
         self.proxy = ""
 
@@ -89,9 +99,11 @@ def debugConfig():
     log.debug("{0}={1}".format("instance_url", config.instance_url))
     log.debug("{0}={1}".format("export_type", config.export_type))
     log.debug("{0}={1}".format("page_size", config.page_size))
+    log.debug("{0}={1}".format("resume", config.resume))
     log.debug("{0}={1}".format("start_sysid", config.start_sysid))
+    log.debug("{0}={1}".format("start_sysid", config.start_page))
     log.debug("{0}={1}".format("export_table", config.export_table))
-    log.debug("{0}={1}".format("temp_dir", config.temp_dir))
+    log.debug("{0}={1}".format("temp_dir", config.export_dir))
     log.debug("{0}={1}".format("export_fields", config.export_fields))
     log.debug("{0}={1}".format("out_file", config.out_file))
     log.debug("{0}={1}".format("display_values", config.display_values))
@@ -100,6 +112,7 @@ def debugConfig():
     log.debug("{0}={1}".format("delta_timestamp", config.delta_timestamp))
     log.debug("{0}={1}".format("delta_field", config.delta_field))
     log.debug("{0}={1}".format("work_dir", config.work_dir))
+    log.debug("{0}={1}".format("no_state", config.no_state))
     log.debug("{0}={1}".format("combine_output", config.combine_output))
     log.debug("{0}={1}".format("progress", config.progress))
     log.debug("{0}={1}".format("proxy", config.proxy))
@@ -124,7 +137,9 @@ def loadConfigFile(fname: str, config: Config):
         if ("instance_url" in fData): config.instance_url = fData["instance_url"]
         if ("export_type" in fData): config.export_type = fData["export_type"]
         if ("page_size" in fData): config.page_size = int(fData["page_size"])
+        if ("resume" in fData): config.resume = fData["resume"]
         if ("start_sysid" in fData): config.start_sysid = fData["start_sysid"]
+        if ("start_page" in fData): config.start_page = fData["start_page"]
         if ("export_table" in fData): config.export_table = fData["export_table"]
         if ("export_query" in fData): config.export_query = fData["export_query"]
         if ("export_fields" in fData): config.export_fields = fData["export_fields"]
@@ -197,7 +212,7 @@ def tryLoginDo(session: requests.Session):
         # Likely a fail
         raise Exception("Login attempt failed {0} {1}".format(response.status_code))
 
-def requestCsv(session: requests.Session, offset=0, last_sysid=None, fname: str = ""):
+def requestCsv(session: requests.Session, page_num=0, last_sysid=None, fname: str = ""):
     """
     Fetch an export of data from ServiceNow as CSV.
     """
@@ -223,7 +238,7 @@ def requestCsv(session: requests.Session, offset=0, last_sysid=None, fname: str 
     queryParts.append(config.export_query)
     query = "^".join(queryParts)
 
-    log.info("Exporting data, table: {0}, offset: {1}, rows: {2}, query: {3}".format(config.export_table, offset, config.page_size, query))
+    log.info(f"Exporting data, page: {page_num}, table: {config.export_table}, rows: {config.page_size}, query: {query}")
 
     urlParms = {
         "CSV":"",
@@ -305,23 +320,22 @@ def exportCsv(session: requests.Session) -> ExportResult:
     """
 
     # Get the export
-    pageNum = 0
     lastSysId = state.last_sysid
     totalRowCount = 0
 
     exportResult = ExportResult()
     
     while True:
-        log.info("Fetching page {0}".format(pageNum))
-        fname = os.path.join(config.temp_dir, "{1}.page_{0}.csv".format(pageNum, config.out_file))
+        log.debug(f"Fetching page {state.page_num}")
+        fname = os.path.join(config.export_dir, "{1}.page_{0}.csv".format(state.page_num, config.out_file))
         log.debug("Writing to {0}".format(fname))
-        requestCsv(session, offset=pageNum*config.page_size, last_sysid=lastSysId, fname=fname)
+        requestCsv(session, state.page_num, last_sysid=lastSysId, fname=fname)
 
         # Check how many rows there are. There should be at leas
         # If it's just the header row and nothing else, there's no data.
         # There should be at least 2: 1 after the header and 1 after at least 1 row. If there's only 1 newline, it's the header and nothiner else.
         # Sadly, can't use python's CSV module for this, it's got issues reading from strings instead of files.
-        exportHasResults = False
+        #exportHasResults = False
         newLineCount = 0
         chunk_size = 8192
         with open(fname, "r", encoding=SN_ENCODING) as f:
@@ -334,7 +348,7 @@ def exportCsv(session: requests.Session) -> ExportResult:
             log.debug("CSV has no rows of data")
 
             if (config.min_rows > 0):
-                _offsetPlus1Page = (pageNum+1) * config.page_size
+                _offsetPlus1Page = (state.page_num+1) * config.page_size
                 log.debug("Attempted export of {0} / min_rows {1}".format(_offsetPlus1Page, config.min_rows))
 
                 if (config.min_rows > 0 and _offsetPlus1Page < config.min_rows):
@@ -387,7 +401,7 @@ def exportCsv(session: requests.Session) -> ExportResult:
             totalRowCount = totalRowCount + newLineCount
         
         # End of page
-        pageNum = pageNum + 1
+        state.page_num = state.page_num + 1
 
         # Save the state
         saveState(state)
@@ -445,22 +459,22 @@ def main():
     parser.add_argument("--export-table", "-t", help="Name of the table to export data from.")
     parser.add_argument("--export-fields", "-f", help="List of fields to export, comma-separated, or '*' for all fields.")
     parser.add_argument("--export-query", "-q", help="Query to use when exporting data.")
-    parser.add_argument("--page-size", "-S", type=int, help="How many rows to export per page.")
-    parser.add_argument("--start-sysid", "-r", type=str, help="The sys_id to start exporting from (not including the sys_id). Useful for resuming a failed export. Overrides the last sysid in the state file.")
-    parser.add_argument("--temp-dir", "-T", help="Directory to save temporary files to.")
+    parser.add_argument("--page-size", "-s", type=int, help="How many rows to export per page.")
+    parser.add_argument("--resume", "-r", action="store_true", help="Resume an incomplete export.")
+    parser.add_argument("--start-sysid", type=str, help="The sys_id to start exporting from (not including the sys_id). Useful for resuming a failed export. Overrides the last sysid in the state file.")
+    parser.add_argument("--start-page", type=int, help="The page to start exporting from. Useful for resuming a failed export. Overrides the last page in the state file.")
+    parser.add_argument("--export-dir", "-T", help="Directory to save export files to.")
     parser.add_argument("--out", "-o", help="Name of file to output the export to. Pages of results will also use this name.")
     parser.add_argument("--display-values", "-d", help="Enable display values when exporting data.")
     parser.add_argument("--no-display-values", "-D", help="Disable display values when exporting data.")
     parser.add_argument("--min-rows", "-m", type=int, help="The minimum amount of rows to export. Useful when there's lots of data 'hidden for security reasons' and may result in an empty page of data. If not provided, export will end on the 1st empty page of data.")
-    parser.add_argument("--state", "-s", help="State file location. Used for tracking page number for resume support, and delta timestamp to export data after last export.")
+    parser.add_argument("--no-state", "-S", help="Don't save the state. Disables resume support.")
     parser.add_argument("--delta-export", "-X", action="store_true", help="Enable delta exports, only exporting data sys_updated_on since the last export.")
     parser.add_argument("--delta-timestamp", "-x", help="Add a sys_updated_on query to only export data updated after the given timestamp. Must be correctly formatted UTC timestamp YYYY-MM-DD HH:MM:SS. Leave blank if you want to use what's in the state file.")
     parser.add_argument("--delta-field", "-F", help="The field to filter the delta timestamp on. Default: sys_updated_on")
     parser.add_argument("--progress", "-P", action="store_true", help="Show progress while exporting.")
-    parser.add_argument("--proxy", "-p", help="Web proxy address to use, authentication must be in-line. http://<ip>:<port> or http://<username>:<password>@<ip>:<port>")
+    parser.add_argument("--proxy", help="Web proxy address to use, authentication must be in-line. http://<ip>:<port> or http://<username>:<password>@<ip>:<port>")
     args = parser.parse_args()
-
-    
 
     logging.basicConfig(filename=None, level=args.verbose and logging.DEBUG or logging.INFO)
 
@@ -475,10 +489,12 @@ def main():
     if (args.instance_url): config.instance_url = args.instance_url 
     if (args.export_type): config.export_type = args.export_type 
     if (args.page_size): config.page_size = args.page_size 
+    if (args.resume): config.resume = True
     if (args.start_sysid): config.start_sysid = args.start_sysid 
+    if (args.start_page): config.start_page = args.start_page 
     if (args.export_table): config.export_table = args.export_table 
     if (args.export_query): config.export_query = args.export_query
-    if (args.temp_dir): config.temp_dir = args.temp_dir
+    if (args.export_dir): config.export_dir = args.export_dir
     if (args.export_fields): config.export_fields = args.export_fields
     if (args.out): config.out_file = args.out
     if (args.display_values): config.display_values = True
@@ -488,9 +504,10 @@ def main():
     if (args.delta_timestamp): config.delta_timestamp = args.delta_timestamp
     if (args.delta_field): config.delta_field = args.delta_field
     if (args.combine_output): config.combine_output = args.combine_output
-    if (args.state): config.state_file = args.state
+    if (args.no_state): config.no_state = args.no_state
     if (args.progress): config.progress = args.progress
     if (args.proxy): config.proxy = args.proxy
+    
 
     debugConfig()
 
@@ -507,22 +524,27 @@ def main():
         startTime = time.time()
 
         # Load state
-        if (config.state_file):
-            if (os.path.exists(config.state_file)):
+        if (not config.no_state):
+            if (os.path.exists(getStateFileName())):
                 loadState(state)
             else:
                 log.info("State file doesn't exist, creating")
                 saveState(state)
         else:
             log.info("Not using state file, resume & delta exports not supported.")
+            config.resume = False
 
         if (config.delta_timestamp):
             log.info(f"Delta timestamp override: {config.delta_timestamp}")
             state.delta_timestamp = config.delta_timestamp
 
-        if (config.start_sysid):
+        if (config.resume and config.start_sysid):
             log.info(f"Start sysid override: {config.start_sysid}")
             state.last_sysid = config.start_sysid
+
+        if (config.resume and config.start_page):
+            log.info(f"Start page override: {config.start_page}")
+            state.page_num = config.start_page
 
         if (state.delta_timestamp): 
             try:
@@ -531,8 +553,8 @@ def main():
                 raise Exception("delta_timestamp is not a ServiceNow formatted timestamp. E.g. 2021-08-15 18:21:06")
 
         # Create temp dir if missing
-        if not os.path.exists(config.temp_dir):
-            os.makedirs(config.temp_dir, exist_ok=True)
+        if not os.path.exists(config.export_dir):
+            os.makedirs(config.export_dir, exist_ok=True)
 
         session = requests.Session()
         log.debug("Auth type: {0}".format(config.auth_type))
@@ -544,31 +566,6 @@ def main():
             if (not config.auth_username): raise ValueError("auth_username cannot be empty in basic auth")
             if (not config.auth_password): raise ValueError("auth_password cannot be empty in basic auth")
             tryLoginDo(session)
-
-        """
-        if config.auth_type == "browser":
-            log.info("Using browser auth. REMEMBER: if auth fails, you might need to close and re-open your browser to make it save the cookies to cookie storage!")
-            # Fetch cookies from the browser
-            import browser_cookie3
-            if config.auth_browser_type == "chrome":
-                log.info("Fetching cookies from Chrome")
-                try:
-                    cj = browser_cookie3.chrome(domain_name=config.instance_url)
-                    session.cookies.update(cj)
-                except Exception as ex:
-                    raise Exception(f"Failed to fetch cookies from Chrome. Make sure Chrome is closed or permissions are granted: {ex}")
-            if config.auth_browser_type == "firefox":
-                log.info("Fetching cookies from Firefox")
-                try:
-                    cj = browser_cookie3.firefox(domain_name=config.instance_url)
-                    for cookie in cj:
-                        log.debug(f"Cookie {cookie.name}={cookie.value}")
-                    session.cookies.update(cj)
-                except Exception as ex:
-                    raise Exception(f"Failed to fetch cookies from Firefox. Make sure Firefox is closed or permissions are granted: {ex}")
-            else:
-                raise Exception("Unknown browser type: {0}".format(config.auth_browser_type))
-        """        
 
         if config.auth_type == "cookies":
             # Just add the session token to the session cookies
@@ -597,8 +594,9 @@ def main():
             }
         
         # Do the export
-        if (state.last_sysid):
-            log.info("Resuming export from sys_id {0}".format(state.last_sysid))
+        if (state.last_sysid or state.page_num != 0):
+            log.info(f"Resuming export from sys_id {state.last_sysid}, page {state.page_num}")
+
         result = exportCsv(session)
         
         if (config.combine_output):
@@ -607,13 +605,17 @@ def main():
                 combinedFileName = f"{combinedFileName}.csv"
             combineCsvFiles(combinedFileName, result.pages)
 
-        # Update the state
+        # Reset the state
         state.last_sysid = "" # Reset last sysid
+        state.page_num = 0
         state.delta_timestamp = datetime.now().strftime(SN_DATETIME_FORMAT)
         saveState(state)
 
     except Exception as ex:
-        log.error(ex)
+        if (log.level == logging.DEBUG):
+            log.error(ex)
+        else:
+            log.error(ex, exc_info=False)
         raise ex
     
     finally:

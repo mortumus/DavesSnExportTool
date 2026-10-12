@@ -19,29 +19,30 @@ Features
 * Python 3
 * `requests`
 
-Required python packages can be installed using the `requirements.txt` file.
-
-```
-pip install -r requirements.txt
-```
-
 ## Usage
-Use this tool in the command line.
+1. Download the `DavesSnExportTool.py` script.
+2. If required, install dependancies by running
+```
+python3 -m pip -r ./requirements.txt
+```
+3. Use the tool in the command line.
 
-Using the export tool will export the data into multiple files, each being **pages** of results, into a **temporary directory** which is `./tmp/` by default.
+Using the export tool will export the data into multiple files, each being **pages** of results, into an **export directory** which is `./export/` by default.
 
 ![Exported files](doc/exported-files.png)
 
 ![Exported data spreadsheet](doc/exported-data-csv.png)
+
+The multiple exports can be **combined** into a single file by using the `-C` option.
 
 ### Help
 
 ```
 usage: DavesSnExportTool.py [-h] [--auth-type {none,basic,cookies}] [--auth-username AUTH_USERNAME] [--auth-password AUTH_PASSWORD] [--auth-cookies AUTH_COOKIES]
                             [--instance-url INSTANCE_URL] [--verbose] [--config CONFIG] [--combine-output] [--export-type {csv}] [--export-table EXPORT_TABLE]
-                            [--export-fields EXPORT_FIELDS] [--export-query EXPORT_QUERY] [--page-size PAGE_SIZE] [--start-sysid START_SYSID] [--temp-dir TEMP_DIR] [--out OUT]
-                            [--display-values DISPLAY_VALUES] [--no-display-values NO_DISPLAY_VALUES] [--min-rows MIN_ROWS] [--state STATE] [--delta-export]
-                            [--delta-timestamp DELTA_TIMESTAMP] [--delta-field DELTA_FIELD] [--progress] [--proxy PROXY]
+                            [--export-fields EXPORT_FIELDS] [--export-query EXPORT_QUERY] [--page-size PAGE_SIZE] [--resume] [--start-sysid START_SYSID] [--start-page START_PAGE]
+                            [--export-dir EXPORT_DIR] [--out OUT] [--display-values DISPLAY_VALUES] [--no-display-values NO_DISPLAY_VALUES] [--min-rows MIN_ROWS] [--no-state NO_STATE]
+                            [--delta-export] [--delta-timestamp DELTA_TIMESTAMP] [--delta-field DELTA_FIELD] [--progress] [--proxy PROXY]
 
 options:
   -h, --help            show this help message and exit
@@ -67,12 +68,15 @@ options:
                         List of fields to export, comma-separated, or '*' for all fields.
   --export-query EXPORT_QUERY, -q EXPORT_QUERY
                         Query to use when exporting data.
-  --page-size PAGE_SIZE, -S PAGE_SIZE
+  --page-size PAGE_SIZE, -s PAGE_SIZE
                         How many rows to export per page.
-  --start-sysid START_SYSID, -r START_SYSID
+  --resume, -r          Resume an incomplete export.
+  --start-sysid START_SYSID
                         The sys_id to start exporting from (not including the sys_id). Useful for resuming a failed export. Overrides the last sysid in the state file.
-  --temp-dir TEMP_DIR, -T TEMP_DIR
-                        Directory to save temporary files to.
+  --start-page START_PAGE
+                        The page to start exporting from. Useful for resuming a failed export. Overrides the last page in the state file.
+  --export-dir EXPORT_DIR, -T EXPORT_DIR
+                        Directory to save export files to.
   --out OUT, -o OUT     Name of file to output the export to. Pages of results will also use this name.
   --display-values DISPLAY_VALUES, -d DISPLAY_VALUES
                         Enable display values when exporting data.
@@ -81,8 +85,8 @@ options:
   --min-rows MIN_ROWS, -m MIN_ROWS
                         The minimum amount of rows to export. Useful when there's lots of data 'hidden for security reasons' and may result in an empty page of data. If not provided,
                         export will end on the 1st empty page of data.
-  --state STATE, -s STATE
-                        State file location. Used for tracking page number for resume support, and delta timestamp to export data after last export.
+  --no-state NO_STATE, -S NO_STATE
+                        Don't save the state. Disables resume support.
   --delta-export, -X    Enable delta exports, only exporting data sys_updated_on since the last export.
   --delta-timestamp DELTA_TIMESTAMP, -x DELTA_TIMESTAMP
                         Add a sys_updated_on query to only export data updated after the given timestamp. Must be correctly formatted UTC timestamp YYYY-MM-DD HH:MM:SS. Leave blank if
@@ -90,8 +94,7 @@ options:
   --delta-field DELTA_FIELD, -F DELTA_FIELD
                         The field to filter the delta timestamp on. Default: sys_updated_on
   --progress, -P        Show progress while exporting.
-  --proxy PROXY, -p PROXY
-                        Web proxy address to use, authentication must be in-line. http://<ip>:<port> or http://<username>:<password>@<ip>:<port>
+  --proxy PROXY         Web proxy address to use, authentication must be in-line. http://<ip>:<port> or http://<username>:<password>@<ip>:<port>
 ```
 
 **Note:** The sys_id column is included in every export due to how the tool exports data.
