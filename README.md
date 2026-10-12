@@ -20,7 +20,7 @@ Features
 * `requests`
 
 ## Usage
-1. Download the `DavesSnExportTool.py` script.
+1. Download the `DavesSnExportTool.py` script and `requirements.txt`.
 2. If required, install dependancies by running
 ```
 python3 -m pip -r ./requirements.txt
