@@ -7,16 +7,26 @@ import urllib.parse
 import csv
 import os
 import json
-#import xml.etree.ElementTree as ET
+import xml.etree.ElementTree as ET
 import argparse
 import requests
 import time
 from datetime import datetime, timezone
 
 SN_DATETIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-SN_ENCODING = "windows-1252"
+SN_ENCODING = "windows-1252" # Encoding of ServiceNow CSV exports
+XML_ENCODING = "utf-8" # ServiceNow XML exports declare themselves as UTF-8
 DEFAULT_EXPORT_DIR = "./export/"
 STATE_FILE_NAME = "{0}.state.json"
+
+# Supported export types.
+# url_flag: the URL parameter that tells ServiceNow which format to export as, e.g. incident_list.do?XML
+# accept: the Accept header to send
+# ext: the file extension to use for page files and the combined file
+EXPORT_TYPES = {
+    "csv": {"url_flag": "CSV", "accept": "text/csv", "ext": ".csv"},
+    "xml": {"url_flag": "XML", "accept": "application/xml, text/xml", "ext": ".xml"},
+}
 
 log = logging.getLogger()
 
@@ -163,7 +173,7 @@ def getUrl(root:str, path:str, parms={}) -> str:
     """
 
     url = "{0}".format(root)
-    if (not url.startswith("http://") or not url.startswith("https://")):
+    if (not url.startswith("http://") and not url.startswith("https://")):
         url = "https://{0}".format(url)
 
     urlParms = ""
@@ -212,10 +222,12 @@ def tryLoginDo(session: requests.Session):
         # Likely a fail
         raise Exception("Login attempt failed {0} {1}".format(response.status_code))
 
-def requestCsv(session: requests.Session, page_num=0, last_sysid=None, fname: str = ""):
+def requestExport(session: requests.Session, page_num=0, last_sysid=None, fname: str = ""):
     """
-    Fetch an export of data from ServiceNow as CSV.
+    Fetch an export of data from ServiceNow in the configured export type (CSV or XML).
     """
+
+    exportType = EXPORT_TYPES[config.export_type]
 
     query = config.export_query
     # Detect and throw exception if there's complexities in query that may cause issues 
@@ -238,10 +250,10 @@ def requestCsv(session: requests.Session, page_num=0, last_sysid=None, fname: st
     queryParts.append(config.export_query)
     query = "^".join(queryParts)
 
-    log.info(f"Exporting data, page: {page_num}, table: {config.export_table}, rows: {config.page_size}, query: {query}")
+    log.info(f"Exporting data, page: {page_num}, table: {config.export_table}, type: {config.export_type}, rows: {config.page_size}, query: {query}")
 
     urlParms = {
-        "CSV":"",
+        exportType["url_flag"]:"",
         "sysparm_query":query,
         "sysparm_orderby":"sys_id", # always order by sys_id, we use this for fetching in chunks
         "sysparm_record_count":config.page_size,
@@ -260,9 +272,9 @@ def requestCsv(session: requests.Session, page_num=0, last_sysid=None, fname: st
     url = getUrl(config.instance_url, "{0}_list.do".format(config.export_table), urlParms)
     
     headers = {
-        "Accept": "text/csv"
+        "Accept": exportType["accept"]
     }
-    
+
     #response = session.get(url, headers=headers)
     response = session.get(url, headers=headers, stream=True)
 
@@ -314,39 +326,157 @@ def printBytesNum(a:int, scale: str="auto"):
     if scale == "mb":
         return f"{a/1024/1024:,.2f} MB"
 
-def exportCsv(session: requests.Session) -> ExportResult:
+def csvPageHasRows(fname: str) -> bool:
     """
-    Export and save data from ServiceNow as CSV.
+    Quickly check whether a CSV page contains any rows of data (not just the header row).
+    """
+
+    # Check how many rows there are.
+    # If it's just the header row and nothing else, there's no data.
+    # There should be at least 2: 1 after the header and 1 after at least 1 row. If there's only 1 newline, it's the header and nothiner else.
+    # Sadly, can't use python's CSV module for this, it's got issues reading from strings instead of files.
+    newLineCount = 0
+    chunk_size = 8192
+    with open(fname, "r", encoding=SN_ENCODING) as f:
+        while chunk := f.read(chunk_size):
+            newLineCount += chunk.count("\n")
+            if (newLineCount > 2):
+                break
+
+    return newLineCount >= 2
+
+def readCsvPage(fname: str, lastSysId: str):
+    """
+    Read a page of CSV data. Returns a tuple of (row count, last sys_id).
+    If the page has no rows, the given lastSysId is returned unchanged.
+    """
+
+    if (not csvPageHasRows(fname)):
+        log.debug("CSV has no rows of data")
+        return (0, lastSysId)
+
+    # Read the CSV
+    # Try to read to get the last sys_id
+
+    # This is really stupid, but Python CSV works better with files than strings.
+    # Otherwise, I was getting issues where the row would only have the 1st cell, not the whole row.
+    # Getting the next row would return 2 empty cells, then the next 1 cell.
+    # I suspect it's having issues with every cell in quotation.
+    # This feels dumb, needing to save it out of memory, only to read it from the file again, but it works.
+    rowCount = 0
+    with open(fname, "r", newline="", encoding=SN_ENCODING) as f:
+        csvReader = csv.reader(f, csv.unix_dialect)
+
+        # Read the 1st row, should be the column headers. Look for "sys_id".
+        csvRow1 = next(csvReader)
+        log.debug("CSV headers: {0}".format(", ".join(csvRow1)))
+
+        sysIdColNum = -1
+        try:
+            sysIdColNum = csvRow1.index("sys_id")
+        except ValueError as ex:
+            raise ValueError("CSV header doesn't contain column for sys_id")
+
+        for line in csvReader:
+            lastSysId = line[sysIdColNum]
+            rowCount = rowCount + 1
+
+    log.debug("Last sys_id: {0}".format(lastSysId))
+    log.debug("{0} rows of data in CSV".format(rowCount))
+    return (rowCount, lastSysId)
+
+def iterXmlRecords(fname: str):
+    """
+    Stream the record elements out of a ServiceNow XML export, one at a time, without loading the whole file into memory.
+
+    A ServiceNow XML export looks like:
+        <xml>
+            <incident>
+                <number>INC0010001</number>
+                <sys_id>...</sys_id>
+                ...
+            </incident>
+            <incident>...</incident>
+        </xml>
+    Each direct child of the root element is one record. The elements within it are the fields.
+    """
+
+    depth = 0
+    root = None
+    with open(fname, "rb") as f:
+        for event, elem in ET.iterparse(f, events=("start", "end")):
+            if event == "start":
+                depth += 1
+                if depth == 1:
+                    root = elem
+            else:
+                depth -= 1
+                if depth == 1:
+                    # A record element just ended. Hand it over, then free it from memory.
+                    yield elem
+                    elem.clear()
+                    if root is not None:
+                        root.remove(elem)
+
+def readXmlPage(fname: str, lastSysId: str):
+    """
+    Read a page of XML data. Returns a tuple of (row count, last sys_id).
+    If the page has no rows, the given lastSysId is returned unchanged.
+    """
+
+    rowCount = 0
+    try:
+        for record in iterXmlRecords(fname):
+            sysIdElem = record.find("sys_id")
+            if (sysIdElem is None or not sysIdElem.text):
+                raise ValueError("XML record <{0}> doesn't contain an element for sys_id".format(record.tag))
+
+            lastSysId = sysIdElem.text.strip()
+            rowCount = rowCount + 1
+    except ET.ParseError as ex:
+        raise ValueError("Export is not valid XML, the instance may have returned an error or login page instead. File: {0}. Error: {1}".format(fname, ex))
+
+    if (rowCount == 0):
+        log.debug("XML has no rows of data")
+    else:
+        log.debug("Last sys_id: {0}".format(lastSysId))
+        log.debug("{0} rows of data in XML".format(rowCount))
+
+    return (rowCount, lastSysId)
+
+def readPage(fname: str, lastSysId: str):
+    """
+    Read a page of exported data in the configured export type. Returns a tuple of (row count, last sys_id).
+    """
+
+    if config.export_type == "csv":
+        return readCsvPage(fname, lastSysId)
+    if config.export_type == "xml":
+        return readXmlPage(fname, lastSysId)
+    raise ValueError("Unsupported export type: {0}".format(config.export_type))
+
+def exportPages(session: requests.Session) -> ExportResult:
+    """
+    Export and save data from ServiceNow, a page at a time, in the configured export type.
     """
 
     # Get the export
     lastSysId = state.last_sysid
     totalRowCount = 0
+    fileExt = EXPORT_TYPES[config.export_type]["ext"]
 
     exportResult = ExportResult()
-    
+
     while True:
         log.debug(f"Fetching page {state.page_num}")
-        fname = os.path.join(config.export_dir, "{1}.page_{0}.csv".format(state.page_num, config.out_file))
+        fname = os.path.join(config.export_dir, "{1}.page_{0}{2}".format(state.page_num, config.out_file, fileExt))
         log.debug("Writing to {0}".format(fname))
-        requestCsv(session, state.page_num, last_sysid=lastSysId, fname=fname)
+        requestExport(session, state.page_num, last_sysid=lastSysId, fname=fname)
 
-        # Check how many rows there are. There should be at leas
-        # If it's just the header row and nothing else, there's no data.
-        # There should be at least 2: 1 after the header and 1 after at least 1 row. If there's only 1 newline, it's the header and nothiner else.
-        # Sadly, can't use python's CSV module for this, it's got issues reading from strings instead of files.
-        #exportHasResults = False
-        newLineCount = 0
-        chunk_size = 8192
-        with open(fname, "r", encoding=SN_ENCODING) as f:
-            while chunk := f.read(chunk_size):
-                newLineCount += chunk.count("\n")
-                if (newLineCount > 2):
-                    break
+        # Read the page to count the rows and find the last sys_id
+        (rowCount, lastSysId) = readPage(fname, lastSysId)
 
-        if (newLineCount < 2):
-            log.debug("CSV has no rows of data")
-
+        if (rowCount == 0):
             if (config.min_rows > 0):
                 _offsetPlus1Page = (state.page_num+1) * config.page_size
                 log.debug("Attempted export of {0} / min_rows {1}".format(_offsetPlus1Page, config.min_rows))
@@ -358,7 +488,7 @@ def exportCsv(session: requests.Session) -> ExportResult:
                     log.debug("Deleting last export, should be empty with no rows")
                     os.remove(fname)
                     return exportResult
-                
+
             else:
                 log.debug("Reached end of export")
                 log.debug("Deleting last export, should be empty with no rows")
@@ -366,46 +496,15 @@ def exportCsv(session: requests.Session) -> ExportResult:
                 return exportResult
 
         exportResult.pages.append(fname)
+        state.last_sysid = lastSysId
+        totalRowCount = totalRowCount + rowCount
 
-        # Read the CSV
-        # Try to read to get the last sys_id
-
-        # This is really stupid, but Python CSV works better with files than strings.
-        # Otherwise, I was getting issues where the row would only have the 1st cell, not the whole row.
-        # Getting the next row would return 2 empty cells, then the next 1 cell. 
-        # I suspect it's having issues with every cell in quotation.
-        # This feels dumb, needing to save it out of memory, only to read it from the file again, but it works.
-        with open(fname, "r", newline="", encoding=SN_ENCODING) as f:
-            csvReader = csv.reader(f, csv.unix_dialect)
-            #csvReader = csv.reader(csvText, csv.unix_dialect)
-            
-            newLineCount = 0
-
-            # Read the 1st row, should be the column headers. Look for "sys_id".
-            csvRow1 = next(csvReader)
-            log.debug("CSV headers: {0}".format(", ".join(csvRow1)))
-            
-            sysIdColNum = -1
-            try:
-                sysIdColNum = csvRow1.index("sys_id")
-            except ValueError as ex:
-                raise ValueError("CSV header doesn't contain column for sys_id")
-
-            for line in csvReader:
-                lastSysId = line[sysIdColNum]
-                state.last_sysid = lastSysId
-                newLineCount = newLineCount + 1
-
-            log.debug("Last sys_id: {0}".format(lastSysId))
-            log.debug("{0} rows of data in CSV".format(newLineCount))
-            totalRowCount = totalRowCount + newLineCount
-        
         # End of page
         state.page_num = state.page_num + 1
 
         # Save the state
         saveState(state)
-    
+
 def combineCsvFiles(outFileName:str, files:list):
     """
     Combine multiple CSV files into one CSV file.
@@ -434,7 +533,42 @@ def combineCsvFiles(outFileName:str, files:list):
                     outFile.write(data)
 
     log.debug("Finished writing to {0}".format(outFileName))
-    
+
+def combineXmlFiles(outFileName:str, files:list):
+    """
+    Combine multiple XML files into one XML file.
+    Each page is a complete XML document with its own root element, so the records are streamed
+    out of each page and written under a single new root element.
+    """
+
+    log.debug("Combining output to file: {0}".format(outFileName))
+    if (len(files) < 1):
+        log.info("No files to combine")
+
+    with open(outFileName, "w", encoding=XML_ENCODING) as outFile:
+        outFile.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+        outFile.write("<xml>\n")
+        for inFileName in files:
+            log.debug("Combining file {0}".format(inFileName))
+            for record in iterXmlRecords(inFileName):
+                record.tail = None # Don't carry over whitespace from the source file
+                outFile.write(ET.tostring(record, encoding="unicode"))
+                outFile.write("\n")
+        outFile.write("</xml>\n")
+
+    log.debug("Finished writing to {0}".format(outFileName))
+
+def combineFiles(outFileName:str, files:list):
+    """
+    Combine multiple page files into one file, in the configured export type.
+    """
+
+    if config.export_type == "csv":
+        return combineCsvFiles(outFileName, files)
+    if config.export_type == "xml":
+        return combineXmlFiles(outFileName, files)
+    raise ValueError("Unsupported export type: {0}".format(config.export_type))
+
 def validateTimestamp(timestamp):
     """
     Validate that the delta timestamp is in the correct SN format.
@@ -455,7 +589,7 @@ def main():
     parser.add_argument("--verbose", "-v", action="store_true", default=False, help="Enable verbose logging.")
     parser.add_argument("--config", "-c", help="Load config from config file.")
     parser.add_argument("--combine-output", "-C", action="store_true", help="Combine the pages of results into 1 output file. Not recommended for multi-GB size exports.")
-    parser.add_argument("--export-type", "-e", choices=["csv"], help="Type of export.")
+    parser.add_argument("--export-type", "-e", choices=list(EXPORT_TYPES.keys()), help="Type of export. Default: csv")
     parser.add_argument("--export-table", "-t", help="Name of the table to export data from.")
     parser.add_argument("--export-fields", "-f", help="List of fields to export, comma-separated, or '*' for all fields.")
     parser.add_argument("--export-query", "-q", help="Query to use when exporting data.")
@@ -514,6 +648,7 @@ def main():
     # Check the config
     if (not config.instance_url): raise ValueError("instance_url cannot be empty")
     if (not config.export_table): raise ValueError("export_table cannot be empty")
+    if (not config.export_type in EXPORT_TYPES): raise ValueError("export_type must be one of: {0}".format(", ".join(EXPORT_TYPES.keys())))
     if (config.page_size < 1): raise ValueError("page_size cannot be less than 1")
     if (not config.export_fields): raise ValueError("export_fields cannot be empty")
     if (not config.out_file): raise ValueError("out_file cannot be empty")
@@ -522,6 +657,10 @@ def main():
 
     try:
         startTime = time.time()
+
+        # Create export dir if missing. Must happen before the state file is saved into it.
+        if not os.path.exists(config.export_dir):
+            os.makedirs(config.export_dir, exist_ok=True)
 
         # Load state
         if (not config.no_state):
@@ -551,10 +690,6 @@ def main():
                 validateTimestamp(state.delta_timestamp)
             except Exception:
                 raise Exception("delta_timestamp is not a ServiceNow formatted timestamp. E.g. 2021-08-15 18:21:06")
-
-        # Create temp dir if missing
-        if not os.path.exists(config.export_dir):
-            os.makedirs(config.export_dir, exist_ok=True)
 
         session = requests.Session()
         log.debug("Auth type: {0}".format(config.auth_type))
@@ -602,13 +737,14 @@ def main():
             state.page_num = 0
             state.last_sysid = ""
 
-        result = exportCsv(session)
-        
+        result = exportPages(session)
+
         if (config.combine_output):
             combinedFileName = config.out_file
-            if config.export_type == "csv" and combinedFileName[-4:] != ".csv":
-                combinedFileName = f"{combinedFileName}.csv"
-            combineCsvFiles(combinedFileName, result.pages)
+            fileExt = EXPORT_TYPES[config.export_type]["ext"]
+            if not combinedFileName.lower().endswith(fileExt):
+                combinedFileName = f"{combinedFileName}{fileExt}"
+            combineFiles(combinedFileName, result.pages)
 
         # Reset the state
         state.last_sysid = "" # Reset last sysid

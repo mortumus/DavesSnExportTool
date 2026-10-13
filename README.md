@@ -5,7 +5,7 @@ Exporting over 1,000 rows of data out of ServiceNow can be difficult and tedious
 
 Features
 * Export unlimited data from ServiceNow from any table your user has access to (default: pages of 1,000 rows).
-* Exports data as comma-separated files (CSV).
+* Exports data as comma-separated files (CSV) or XML.
 * Exports using the URL export features, no need for Table API access. Any user can do it!
 * Can export display values or system values.
 * Authenticate as your browser's session, compatible with SSO authentication.
@@ -35,11 +35,13 @@ Using the export tool will export the data into multiple files, each being **pag
 
 The multiple exports can be **combined** into a single file by using the `-C` option.
 
+Use `--export-type xml` (or `-e xml`) to export as XML instead of CSV. See [Exporting as XML](#exporting-as-xml).
+
 ### Help
 
 ```
 usage: DavesSnExportTool.py [-h] [--auth-type {none,basic,cookies}] [--auth-username AUTH_USERNAME] [--auth-password AUTH_PASSWORD] [--auth-cookies AUTH_COOKIES]
-                            [--instance-url INSTANCE_URL] [--verbose] [--config CONFIG] [--combine-output] [--export-type {csv}] [--export-table EXPORT_TABLE]
+                            [--instance-url INSTANCE_URL] [--verbose] [--config CONFIG] [--combine-output] [--export-type {csv,xml}] [--export-table EXPORT_TABLE]
                             [--export-fields EXPORT_FIELDS] [--export-query EXPORT_QUERY] [--page-size PAGE_SIZE] [--resume] [--start-sysid START_SYSID] [--start-page START_PAGE]
                             [--export-dir EXPORT_DIR] [--out OUT] [--display-values DISPLAY_VALUES] [--no-display-values NO_DISPLAY_VALUES] [--min-rows MIN_ROWS] [--no-state NO_STATE]
                             [--delta-export] [--delta-timestamp DELTA_TIMESTAMP] [--delta-field DELTA_FIELD] [--progress] [--proxy PROXY]
@@ -60,8 +62,8 @@ options:
   --config CONFIG, -c CONFIG
                         Load config from config file.
   --combine-output, -C  Combine the pages of results into 1 output file. Not recommended for multi-GB size exports.
-  --export-type {csv}, -e {csv}
-                        Type of export.
+  --export-type {csv,xml}, -e {csv,xml}
+                        Type of export. Default: csv
   --export-table EXPORT_TABLE, -t EXPORT_TABLE
                         Name of the table to export data from.
   --export-fields EXPORT_FIELDS, -f EXPORT_FIELDS
@@ -149,6 +151,35 @@ python3 ./DavesSnExportTool.py -i dev123456.service-now.com -t incident -o incid
 
 * 1st run: export's everything, saves the date & time to the state file.
 * future runs: filters data to only what's changed since the last run.
+
+### Example 6
+Export all incidents as **XML** instead of CSV, and combine the pages into a single `incident_feed.xml` file.
+
+```
+python3 ./DavesSnExportTool.py -i dev123456.service-now.com -t incident -o incident_feed -f "*" --export-type xml --combine-output --auth-type cookies --auth-cookies "<browser cookies>"
+```
+
+## Exporting as XML
+Set `--export-type xml` (or `"export_type": "xml"` in a config file) to use ServiceNow's XML URL export (`<table>_list.do?XML`) instead of CSV.
+
+* Pages are saved as `<out>.page_<n>.xml`, and the combined file (with `-C`) as `<out>.xml`.
+* Each page is a complete XML document. The root element is `<xml>`, and each record is a child element named after the table, with one child element per field:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<xml>
+    <incident>
+        <number>INC0010001</number>
+        <short_description>Email is down</short_description>
+        <sys_id>a9e30c7dc61122760116894de7bcc7bd</sys_id>
+    </incident>
+    <incident>...</incident>
+</xml>
+```
+
+* When combining pages, the records from every page are written under one `<xml>` root element, so the combined file is a single valid XML document.
+* XML exports are UTF-8 encoded (as ServiceNow produces them). CSV exports remain windows-1252 encoded.
+* All other options (queries, field lists, display values, paging, resume, delta exports) work the same as for CSV.
 
 ## Cookie authentication
 The export tool can authenticate using your browser's ServiceNow session. To do this, we'll need to get your **cookies** to the tool.
