@@ -222,6 +222,21 @@ def tryLoginDo(session: requests.Session):
         # Likely a fail
         raise Exception("Login attempt failed {0} {1}".format(response.status_code))
 
+def getExportFieldList():
+    """
+    The list of fields to export, always including sys_id. Returns None if all fields ("*") are being exported.
+    """
+
+    if config.export_fields == "*":
+        return None
+
+    # Always include sys_id, it's needed for paging
+    fieldList = [f.strip() for f in config.export_fields.split(",") if f.strip()]
+    if not "sys_id" in fieldList:
+        log.debug("Adding sys_id to field list")
+        fieldList.append("sys_id")
+    return fieldList
+
 def requestExport(session: requests.Session, page_num=0, last_sysid=None, fname: str = ""):
     """
     Fetch an export of data from ServiceNow in the configured export type (CSV or XML).
@@ -259,14 +274,10 @@ def requestExport(session: requests.Session, page_num=0, last_sysid=None, fname:
         "sysparm_record_count":config.page_size,
         "sysparm_display_value": config.display_values
     }
-    if config.export_fields == "*":
+    fieldList = getExportFieldList()
+    if fieldList is None:
         urlParms["sysparm_default_export_fields"] = "all"
     else:
-        # Always include sys_id
-        fieldList = config.export_fields.split(",")
-        if not "sys_id" in fieldList: 
-            log.debug("Adding sys_id to field list")
-            fieldList.append("sys_id")
         urlParms["sysparm_fields"] = ",".join(fieldList)
 
     url = getUrl(config.instance_url, "{0}_list.do".format(config.export_table), urlParms)
@@ -418,6 +429,37 @@ def iterXmlRecords(fname: str):
                     if root is not None:
                         root.remove(elem)
 
+def filterXmlPageFields(fname: str, fieldList: list):
+    """
+    Rewrite an XML page so each record only contains the given fields.
+
+    ServiceNow's XML URL export ignores sysparm_fields and always returns every field,
+    so the field list is applied here instead, after the page has been downloaded.
+    The page is streamed record by record into a new file which then replaces the original.
+    """
+
+    keepFields = set(fieldList)
+    log.debug("Filtering XML page to fields: {0}".format(", ".join(fieldList)))
+
+    tmpFname = fname + ".tmp"
+    try:
+        with open(tmpFname, "w", encoding=XML_ENCODING) as outFile:
+            outFile.write('<?xml version="1.0" encoding="UTF-8"?>\n')
+            outFile.write("<xml>\n")
+            for record in iterXmlRecords(fname):
+                for field in list(record):
+                    if field.tag not in keepFields:
+                        record.remove(field)
+                record.tail = None
+                outFile.write(ET.tostring(record, encoding="unicode"))
+                outFile.write("\n")
+            outFile.write("</xml>\n")
+    except ET.ParseError as ex:
+        os.remove(tmpFname)
+        raise ValueError("Export is not valid XML, the instance may have returned an error or login page instead. File: {0}. Error: {1}".format(fname, ex))
+
+    os.replace(tmpFname, fname)
+
 def readXmlPage(fname: str, lastSysId: str):
     """
     Read a page of XML data. Returns a tuple of (row count, last sys_id).
@@ -472,6 +514,11 @@ def exportPages(session: requests.Session) -> ExportResult:
         fname = os.path.join(config.export_dir, "{1}.page_{0}{2}".format(state.page_num, config.out_file, fileExt))
         log.debug("Writing to {0}".format(fname))
         requestExport(session, state.page_num, last_sysid=lastSysId, fname=fname)
+
+        # ServiceNow ignores the field list for XML exports, so apply it here
+        fieldList = getExportFieldList()
+        if (config.export_type == "xml" and fieldList is not None):
+            filterXmlPageFields(fname, fieldList)
 
         # Read the page to count the rows and find the last sys_id
         (rowCount, lastSysId) = readPage(fname, lastSysId)

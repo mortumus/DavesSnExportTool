@@ -179,7 +179,8 @@ Set `--export-type xml` (or `"export_type": "xml"` in a config file) to use Serv
 
 * When combining pages, the records from every page are written under one `<xml>` root element, so the combined file is a single valid XML document.
 * XML exports are UTF-8 encoded (as ServiceNow produces them). CSV exports remain windows-1252 encoded.
-* All other options (queries, field lists, display values, paging, resume, delta exports) work the same as for CSV.
+* `--export-fields` works, but note that ServiceNow's XML export ignores the field list and always sends every field. The tool removes the unwanted fields from each page after it's downloaded, so the saved files only contain the requested fields (plus `sys_id`), but the download itself is not any smaller.
+* All other options (queries, display values, paging, resume, delta exports) work the same as for CSV.
 
 ## Cookie authentication
 The export tool can authenticate using your browser's ServiceNow session. To do this, we'll need to get your **cookies** to the tool.
